@@ -152,17 +152,20 @@ def read_file_write_server(agent, username, password, url, infilename)
         puts "Processing tab #{tab}, row #{rownum}" if $debug
         data = {}
         colnum = 0
-        while (col = row[colnum])
-          key = ws[0][colnum].value
-          if /(?<prefix>.*)\/(?<suffix>.*)/ =~ key
-            data[prefix] = {} unless data[prefix]
-            data[prefix][suffix] = col && col.value.to_s
-          else
-            data[key] = col && col.value.to_s
+        # The first column is assumed to have an value in it for all valid rows. If not, skip it (skips blank trailing rows)
+        if row[0] && row[0].value && !row[0].value.to_s.empty?
+          while (col = row[colnum])
+            key = ws[0][colnum].value
+            if /(?<prefix>.*)\/(?<suffix>.*)/ =~ key
+              data[prefix] = {} unless data[prefix]
+              data[prefix][suffix] = col && col.value.to_s
+            else
+              data[key] = col && col.value.to_s
+            end
+            colnum += 1
           end
-          colnum += 1
+          result_page = send_server_request(agent, username, password, url, ws.sheet_name, data)
         end
-        result_page = send_server_request(agent, username, password, url, ws.sheet_name, data)
         rownum += 1
       end
     end
