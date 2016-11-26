@@ -109,24 +109,15 @@ def read_server_write_file(agent, username, password, url, outfilename, field_bl
 end
 
 ####
-# Call RubyXL's add_cell method on a table being built.  If this is the first table row,
-# write a corresponding header row entry.
+# Retrieve the form relating to a particular spreadsheet row from the server and fill it in with the provided data.
+# Submit the form.
 ####
 def send_server_request(agent, username, password, url, category, data)
   category.downcase!
   result_page = nil
   puts "uploading #{category.chop}: #{data[category.chop].to_s}" unless $quiet
   if category == 'extensions'
-    tech_to_tech_hardware = {
-        'custom' => 'custom_custom',
-        'dahdi' => 'dahdi_generic',
-        'iax2' => 'iax2_generic',
-        'pjsip' => 'pjsip_generic',
-        'sip' => 'sip_generic',
-        'virtual' => 'virtual'
-    }
     ext_page = get_page(agent, username, password, url + CONFIG,
-                        #                        {display: :extensions, tech_hardware: tech_to_tech_hardware[data['tech']]})
                         {display: :extensions, tech_hardware: 'custom_custom'})
     result_page = ext_page.form('frm_extensions') do |frm|
       if $debug
