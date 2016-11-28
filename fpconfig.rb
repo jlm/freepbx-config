@@ -6,7 +6,7 @@
 
 # This program can read a FreePBX server configuration from the server and write it to an Excel spreadsheet.
 # It can also read the spreadsheet format and write it back into the server.
-# At present it can only handle Extensions.
+# At present it can only handle Extensions and Trunks.
 
 require 'rubygems'
 require 'mechanize'
@@ -59,6 +59,7 @@ def ws_add_data(ws, row, col, key, val)
     ws.add_cell(row-1, col, key.to_s)
   end
   ws.add_cell(row, col, val.to_s)
+  abort "Error: internal error: #{val.to_s}" if key.to_s =~ /^Error/
   puts "ws_add_data: #{key.to_s}: #{val.to_s}" if $debug
 end
 
@@ -132,14 +133,13 @@ def read_server_write_file(agent, username, password, url, outfilename, field_bl
       # Trunks have a subcategory: tech.  Different technologies have different attributes, which means they can't
       # share a tab in the Excel file so easily.
       when /trunks\./
-        /trunks\.(?<tech>.*)/ =~ category
-        category = 'trunks'
+        category,tech = category.split('.')
         trunks_page = get_page(agent, username, password, url + CONFIG, {display: :trunks})
         trunks_grid_result = get_page(agent, username, password, url + AJAX,
                                       {module: :core, command: :getJSON, jdata: :allTrunks, order: :asc}, trunks_page.uri.to_s)
         trunks_grid = JSON.parse(trunks_grid_result.body)
-        row = 1
 
+        row = 1
         trunks_page.css('table#table-all/tbody/tr').each do |tr|  # For each trunk, find its table row...
           next unless tr.css('td')[1].text == tech                # ...ignore if wrong tech
           override = {}
@@ -155,21 +155,17 @@ def read_server_write_file(agent, username, password, url, outfilename, field_bl
             # a JavaScript script retrieves some JSON data and sets some of the radioboxes.  It even overrides
             # the value of the 'outcid' field (which is not emulated here).
             override = {
-                hcidyes:          (/hidden/ =~ trk_data['outcid']),
-                hcidno:          !(/hidden/ =~ trk_data['outcid']),
-                keepcidoff:        trk_data['keepcid'] == 'off',
-                keepcidon:         trk_data['keepcid'] == 'on',
-                keepcidcnum:       trk_data['keepcid'] == 'cnum',
-                keepcidall:        trk_data['keepcid'] == 'all',
-                continueno:        trk_data['continue'] == 'off',
-                continueyes:     !(trk_data['continue'] == 'off'),
-                disabletrunkno:    trk_data['disabled'] == 'off',
+                hcidyes: (/hidden/ =~ trk_data['outcid']),
+                hcidno: !(/hidden/ =~ trk_data['outcid']),
+                keepcidoff: trk_data['keepcid'] == 'off',
+                keepcidon: trk_data['keepcid'] == 'on',
+                keepcidcnum: trk_data['keepcid'] == 'cnum',
+                keepcidall: trk_data['keepcid'] == 'all',
+                continueno: trk_data['continue'] == 'off',
+                continueyes: !(trk_data['continue'] == 'off'),
+                disabletrunkno: trk_data['disabled'] == 'off',
                 disabletrunkyes: !(trk_data['disabled'] == 'off')
             }
-
-            case tech
-              when 'sip'
-            end
 
             ws ||= wb.add_worksheet(tab)
             write_row_from_form(ws, row, trunk_page.form('trunkEdit'),
@@ -188,23 +184,27 @@ end
 # Retrieve the form relating to a particular spreadsheet row from the server and fill it in with the provided data.
 # Submit the form.
 ####
-def fill_form_and_submit(agent, username, password, url, category, data)
-  result_page = nil
-  puts "uploading #{category.chop}: #{data[category.chop].to_s}" unless $quiet
-  if category == 'extensions'
-    ext_page = get_page(agent, username, password, url + CONFIG,
-                        {display: :extensions, tech_hardware: 'custom_custom'})
-    result_page = ext_page.form('frm_extensions') do |frm|
-      if $debug
-        frm.fields.each { |field| puts "send_sever_request: #{field.name}: #{field.value}" }
-        frm.checkboxes.each { |chkbx| puts "send_sever_request: #{chkbx.name}: #{chkbx.value}" }
-        frm.radiobuttons.each { |rdb| puts "send_sever_request: #{rdb.name}: #{rdb.value}" if rdb.checked }
-      end
-      # Fill in the form, and submit it!
-      data.each { |key, val| frm[key] = val }
-    end.submit
-    result_page
+def fill_form_and_submit(agent, username, password, url, category, tech, data)
+  case category
+    when 'extensions'
+      puts "uploading #{category.chop}: #{data[category.chop].to_s}" unless $quiet
+      cat_page = get_page(agent, username, password, url + CONFIG, {display: category, tech_hardware: 'custom_custom'})
+      frm = cat_page.form('frm_extensions')
+    when 'trunks'
+      puts "uploading #{category.chop}: #{data['trunk_name'].to_s}" unless $quiet
+      cat_page = get_page(agent, username, password, url + CONFIG, {display: category, tech: tech.upcase})
+      frm = cat_page.form('trunkEdit')
   end
+  abort 'error: form not found' unless frm
+
+  if $debug
+    frm.fields.each { |field| puts "send_sever_request: #{field.name}: #{field.value}" }
+    frm.checkboxes.each { |chkbx| puts "send_sever_request: #{chkbx.name}: #{chkbx.value}" }
+    frm.radiobuttons.each { |rdb| puts "send_sever_request: #{rdb.name}: #{rdb.value}" if rdb.checked }
+  end
+  # Fill in the form, and submit it!
+  data.each { |key, val| frm[key] = val }
+  frm.submit
 end
 
 def read_file_write_server(agent, username, password, url, infilename, categories)
@@ -233,16 +233,17 @@ def read_file_write_server(agent, username, password, url, infilename, categorie
         # The first column is assumed to have an value in it for all valid rows. If not, skip it (skips blank trailing rows)
         if row[0] && row[0].value && !row[0].value.to_s.empty?
           while (col = row[colnum])
+            abort "Error: missing column heading for sheet #{tab}, cell #{RubyXL::Reference.ind2ref(rownum, colnum)}" unless ws[0][colnum]
             key = ws[0][colnum].value
-            if /(?<prefix>.*)\/(?<suffix>.*)/ =~ key              # This deals with subsettings of the form "big/small"
+            if /(?<prefix>.*)\/(?<suffix>.*)/ =~ key # This deals with subsettings of the form "big/small"
               data[prefix] = {} unless data[prefix]
               data[prefix][suffix] = col && col.value.to_s
             else
-              data[key] = col && col.value.to_s                   # This is the usual case
+              data[key] = col && col.value.to_s # This is the usual case
             end
             colnum += 1
           end
-          result_page = fill_form_and_submit(agent, username, password, url, category, data)
+          result_page = fill_form_and_submit(agent, username, password, url, category, tech, data)
         end
         rownum += 1
       end
@@ -272,7 +273,7 @@ begin
     o.string '-s', '--secrets', 'pathname of secrets file in YAML format (default: secrets.yml)', default: 'secrets.yml'
     o.string '-u', '--username', 'username to access the FreePBX server'
     o.string '-p', '--password', 'password to access the FreePBX server'
-    o.array  '-c', '--categories', 'list of categories (e.g. "trunks") to process, default: all', delimiter: ','
+    o.array '-c', '--categories', 'list of categories (e.g. "trunks") to process, default: all', delimiter: ','
     o.bool '-d', '--debug', 'print verbose debug messages'
     o.bool '-q', '--quiet', 'do not print progress messages'
     o.string '-o', '--output', 'read configuration from server and write Excel format to named output file'
