@@ -15,8 +15,9 @@ require 'json'
 require 'rubyXL'
 require 'slop'
 
-CONFIG = '/admin/config.php'
-AJAX = '/admin/ajax.php'
+ADMIN = '/admin'
+CONFIG = ADMIN + '/config.php'
+AJAX = ADMIN + '/ajax.php'
 
 ####
 # Call Mechanize's get method with an optional referer.
@@ -42,7 +43,7 @@ def get_page(agent, username, password, url, params, referer = nil)
       login_form.username = username
       login_form.password = password
       page = agent.submit(login_form)
-      abort 'login failed' unless page.css('div#login_form').empty?
+      abort 'Error: login failed' unless page.css('div#login_form').empty?
       page = get_with_ref(agent, url, params, referer)
     end
   end
@@ -62,46 +63,121 @@ def ws_add_data(ws, row, col, key, val)
 end
 
 ####
+# Extract the data from a form.  Write the data to a row of a worksheet, filtering the data to remove blacklisted keys
+# and re-ordering it to place preferred columns first.
+####
+def write_row_from_form(ws, row, form, my_blacklist, my_order, override = {})
+  data = {}
+  form.fields.each { |ff| data[ff.name] = ff.value }
+  form.checkboxes.each { |ff| data[ff.name] = ff.value }
+  form.radiobuttons.each do |ff|
+    if ff.checked
+      data[ff.name] = ff.value
+    elsif ff.respond_to? :id
+      data[ff.name] = ff.value if override[ff.id]
+    end
+  end
+
+  my_blacklist.each { |bad| data.delete(bad) }
+  col = 0
+  my_order.each do |efn|
+    next unless data[efn]
+    ws_add_data(ws, row, col, efn, data[efn])
+    data.delete(efn)
+    col += 1
+  end
+  data.each do |key, val|
+    ws_add_data(ws, row, col, key, val)
+    col += 1
+  end
+end
+
+####
 # Log in to the FreePBX server and read various parameters.  Save them into an Excel spreadsheet.
 ####
-def read_server_write_file(agent, username, password, url, outfilename, field_blacklist, field_order)
+def read_server_write_file(agent, username, password, url, outfilename, field_blacklist, field_order, categories)
   stage = 2
 
   wb = RubyXL::Workbook.new
+
+  # Admin worksheet
   ws_admin = wb.add_worksheet('Admin')
   ws_admin.add_cell(0, 0, 'Admin user')
   ws_admin.add_cell(0, 1, 'Password')
   ws_admin.add_cell(1, 0, username)
   ws_admin.add_cell(1, 1, password)
 
-  ext_page = get_page(agent, username, password, url + CONFIG, {display: :extensions})
-  ext_grid_result = get_page(agent, username, password, url + AJAX,
-                             {module: :core, command: :getExtensionGrid, type: :all, order: :asc}, ext_page.uri.to_s)
-  ext_grid = JSON.parse(ext_grid_result.body)
+  ['Extensions', 'Trunks.dahdi', 'Trunks.sip', 'Trunks.iax2'].each do |tab|
+    category = tab.downcase
+    next unless categories.empty? || categories.include?(category.sub(/\..*/, ''))
+    ws = nil # Delay creating the worksheet until we know whether there are any entries to put on it
 
-  ws = wb.add_worksheet('Extensions')
-  row = 1
-  ext_grid.each do |ext|
-    data = {}
-    ext_page = get_page(agent, username, password, url + CONFIG,
-                        {display: :extensions, extdisplay: ext['extension']}, ext_grid_result.uri.to_s)
-    ext_page.form('frm_extensions').fields.each { |ff| data[ff.name] = ff.value }
-    ext_page.form('frm_extensions').checkboxes.each { |ff| data[ff.name] = ff.value }
-    ext_page.form('frm_extensions').radiobuttons.each { |ff| data[ff.name] = ff.value if ff.checked }
+    case category
+      # Extensions have a subcategory: tech.  However the same form is used for all techs, so they can share a tab.
+      when 'extensions'
+        ext_page = get_page(agent, username, password, url + CONFIG, {display: category})
+        ext_grid_result = get_page(agent, username, password, url + AJAX,
+                                   {module: :core, command: :getExtensionGrid, type: :all, order: :asc}, ext_page.uri.to_s)
+        ext_grid = JSON.parse(ext_grid_result.body)
+        row = 1
+        ext_grid.each do |ext|
+          ext_page = get_page(agent, username, password, url + CONFIG,
+                              {display: :extensions, extdisplay: ext['extension']}, ext_grid_result.uri.to_s)
+          puts "Extension #{ext['extension']}" unless $quiet
+          ws ||= wb.add_worksheet(tab)
+          write_row_from_form(ws, row, ext_page.form('frm_extensions'), field_blacklist[category], field_order[category])
+          row += 1
+        end
 
-    field_blacklist.each { |bad| data.delete(bad) }
-    col = 0
-    field_order.each do |efn|
-      next unless data[efn]
-      ws_add_data(ws, row, col, efn, data[efn])
-      data.delete(efn)
-      col += 1
+      # Trunks have a subcategory: tech.  Different technologies have different attributes, which means they can't
+      # share a tab in the Excel file so easily.
+      when /trunks\./
+        /trunks\.(?<tech>.*)/ =~ category
+        category = 'trunks'
+        trunks_page = get_page(agent, username, password, url + CONFIG, {display: :trunks})
+        trunks_grid_result = get_page(agent, username, password, url + AJAX,
+                                      {module: :core, command: :getJSON, jdata: :allTrunks, order: :asc}, trunks_page.uri.to_s)
+        trunks_grid = JSON.parse(trunks_grid_result.body)
+        row = 1
+
+        trunks_page.css('table#table-all/tbody/tr').each do |tr|  # For each trunk, find its table row...
+          next unless tr.css('td')[1].text == tech                # ...ignore if wrong tech
+          override = {}
+          a = tr.css('td/a')                                      # Find the 'edit' link
+          if a and a.first
+            linkaddr = a.first['href']                            # Follow trunk's 'edit' link
+            trunk_page = get_page(agent, username, password, url + ADMIN + '/' + linkaddr, '', trunks_page.uri.to_s)
+            # Look up this trunk in the JSON data returned from the AJAX request (without assuming row ordering)
+            trk_data = trunks_grid.detect { |e| e['trunkid'] == tr['id'] }
+            puts "Trunk #{trk_data['name']}" unless $quiet
+            # Tell the form-reader to override certain radioboxes, based on the JSON data.
+            # This is necessary because the returned form doesn't contain the currently selected data. Instead,
+            # a JavaScript script retrieves some JSON data and sets some of the radioboxes.  It even overrides
+            # the value of the 'outcid' field (which is not emulated here).
+            override = {
+                hcidyes:          (/hidden/ =~ trk_data['outcid']),
+                hcidno:          !(/hidden/ =~ trk_data['outcid']),
+                keepcidoff:        trk_data['keepcid'] == 'off',
+                keepcidon:         trk_data['keepcid'] == 'on',
+                keepcidcnum:       trk_data['keepcid'] == 'cnum',
+                keepcidall:        trk_data['keepcid'] == 'all',
+                continueno:        trk_data['continue'] == 'off',
+                continueyes:     !(trk_data['continue'] == 'off'),
+                disabletrunkno:    trk_data['disabled'] == 'off',
+                disabletrunkyes: !(trk_data['disabled'] == 'off')
+            }
+
+            case tech
+              when 'sip'
+            end
+
+            ws ||= wb.add_worksheet(tab)
+            write_row_from_form(ws, row, trunk_page.form('trunkEdit'),
+                                field_blacklist[category], field_order[category], override)
+            row += 1
+          end
+        end
     end
-    data.each do |key, val|
-      ws_add_data(ws, row, col, key, val)
-      col += 1
-    end
-    row += 1
   end
 
   #wb.delete_worksheet('Sheet1')
@@ -112,8 +188,7 @@ end
 # Retrieve the form relating to a particular spreadsheet row from the server and fill it in with the provided data.
 # Submit the form.
 ####
-def send_server_request(agent, username, password, url, category, data)
-  category.downcase!
+def fill_form_and_submit(agent, username, password, url, category, data)
   result_page = nil
   puts "uploading #{category.chop}: #{data[category.chop].to_s}" unless $quiet
   if category == 'extensions'
@@ -132,7 +207,7 @@ def send_server_request(agent, username, password, url, category, data)
   end
 end
 
-def read_file_write_server(agent, username, password, url, infilename)
+def read_file_write_server(agent, username, password, url, infilename, categories)
   wb = RubyXL::Parser.parse(infilename)
   puts "Reading from #{infilename}" if $debug
   result_page = nil
@@ -144,8 +219,11 @@ def read_file_write_server(agent, username, password, url, infilename)
     password ||= ws[1][1]
   end
 
-  ['Extensions'].each do |tab|
+  ['Extensions', 'Trunks.dahdi', 'Trunks.sip', 'Trunks.iax2'].each do |tab|
     ws = wb[tab]
+    category, tech = tab.downcase.split('.')
+    next unless categories.empty? || categories.include?(category)
+
     if ws
       rownum = 1
       while (row = ws[rownum])
@@ -156,15 +234,15 @@ def read_file_write_server(agent, username, password, url, infilename)
         if row[0] && row[0].value && !row[0].value.to_s.empty?
           while (col = row[colnum])
             key = ws[0][colnum].value
-            if /(?<prefix>.*)\/(?<suffix>.*)/ =~ key
+            if /(?<prefix>.*)\/(?<suffix>.*)/ =~ key              # This deals with subsettings of the form "big/small"
               data[prefix] = {} unless data[prefix]
               data[prefix][suffix] = col && col.value.to_s
             else
-              data[key] = col && col.value.to_s
+              data[key] = col && col.value.to_s                   # This is the usual case
             end
             colnum += 1
           end
-          result_page = send_server_request(agent, username, password, url, ws.sheet_name, data)
+          result_page = fill_form_and_submit(agent, username, password, url, category, data)
         end
         rownum += 1
       end
@@ -194,6 +272,7 @@ begin
     o.string '-s', '--secrets', 'pathname of secrets file in YAML format (default: secrets.yml)', default: 'secrets.yml'
     o.string '-u', '--username', 'username to access the FreePBX server'
     o.string '-p', '--password', 'password to access the FreePBX server'
+    o.array  '-c', '--categories', 'list of categories (e.g. "trunks") to process, default: all', delimiter: ','
     o.bool '-d', '--debug', 'print verbose debug messages'
     o.bool '-q', '--quiet', 'do not print progress messages'
     o.string '-o', '--output', 'read configuration from server and write Excel format to named output file'
@@ -238,9 +317,10 @@ agent = Mechanize.new
 agent.set_proxy(ph, pp) if $debug && ph && pp
 
 if opts[:output]
-  read_server_write_file(agent, username, password, url, opts[:output], config['extn_field_blacklist'], config['extn_field_order'])
+  read_server_write_file(agent, username, password, url, opts[:output],
+                         config['field_blacklist'], config['field_order'], opts[:categories])
 end
 
 if opts[:write_to_server]
-  read_file_write_server(agent, username, password, url, opts[:write_to_server])
+  read_file_write_server(agent, username, password, url, opts[:write_to_server], opts[:categories])
 end
