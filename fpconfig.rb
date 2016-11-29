@@ -19,6 +19,9 @@ ADMIN = '/admin'
 CONFIG = ADMIN + '/config.php'
 AJAX = ADMIN + '/ajax.php'
 
+SUPPORTED_TABS = %w(Extensions.dahdi Extensions.sip Extensions.iax2 Trunks.dahdi Trunks.sip Trunks.iax2)
+
+
 ####
 # Call Mechanize's get method with an optional referer.
 # There must be a proper way to do this, but I couldn't figure it out.
@@ -108,17 +111,19 @@ def read_server_write_file(agent, username, password, url, outfilename, field_bl
   ws_admin.add_cell(1, 0, username)
   ws_admin.add_cell(1, 1, password)
 
-  ['Extensions', 'Trunks.dahdi', 'Trunks.sip', 'Trunks.iax2'].each do |tab|
+  SUPPORTED_TABS.each do |tab|
     category = tab.downcase
     next unless categories.empty? || categories.include?(category.sub(/\..*/, ''))
     ws = nil # Delay creating the worksheet until we know whether there are any entries to put on it
 
     case category
-      # Extensions have a subcategory: tech.  However the same form is used for all techs, so they can share a tab.
-      when 'extensions'
+      # Extensions have a subcategory: tech. Different technologies have different attributes, which means they can't
+      # share a tab in the Excel file so easily.
+      when /extensions\./
+        category,tech = category.split('.')
         ext_page = get_page(agent, username, password, url + CONFIG, {display: category})
         ext_grid_result = get_page(agent, username, password, url + AJAX,
-                                   {module: :core, command: :getExtensionGrid, type: :all, order: :asc}, ext_page.uri.to_s)
+                                   {module: :core, command: :getExtensionGrid, type: tech, order: :asc}, ext_page.uri.to_s)
         ext_grid = JSON.parse(ext_grid_result.body)
         row = 1
         ext_grid.each do |ext|
@@ -219,7 +224,7 @@ def read_file_write_server(agent, username, password, url, infilename, categorie
     password ||= ws[1][1]
   end
 
-  ['Extensions', 'Trunks.dahdi', 'Trunks.sip', 'Trunks.iax2'].each do |tab|
+  SUPPORTED_TABS.each do |tab|
     ws = wb[tab]
     category, tech = tab.downcase.split('.')
     next unless categories.empty? || categories.include?(category)
