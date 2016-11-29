@@ -54,23 +54,9 @@ def get_page(agent, username, password, url, params, referer = nil)
 end
 
 ####
-# Call RubyXL's add_cell method on a table being built.  If this is the first table row,
-# write a corresponding header row entry.
+# Extract the data from a form.  Construct a table row from it, filtering the data to remove blacklisted keys.
 ####
-def ws_add_data(ws, row, col, key, val)
-  if row == 1
-    ws.add_cell(row-1, col, key.to_s)
-  end
-  ws.add_cell(row, col, val.to_s)
-  abort "Error: internal error: #{val.to_s}" if key.to_s =~ /^Error/
-  puts "ws_add_data: #{key.to_s}: #{val.to_s}" if $debug
-end
-
-####
-# Extract the data from a form.  Write the data to a row of a worksheet, filtering the data to remove blacklisted keys
-# and re-ordering it to place preferred columns first.
-####
-def write_row_from_form(ws, row, form, my_blacklist, my_order, override = {})
+def construct_row_from_form(form, my_blacklist, override = {})
   data = {}
   form.fields.each { |ff| data[ff.name] = ff.value }
   form.checkboxes.each { |ff| data[ff.name] = ff.value }
@@ -83,16 +69,38 @@ def write_row_from_form(ws, row, form, my_blacklist, my_order, override = {})
   end
 
   my_blacklist.each { |bad| data.delete(bad) }
-  col = 0
-  my_order.each do |efn|
-    next unless data[efn]
-    ws_add_data(ws, row, col, efn, data[efn])
-    data.delete(efn)
-    col += 1
+  data
+end
+
+####
+# Write the table to a worksheet, ensuring that the set of columns is the superset of the set of keys in all the rows.
+####
+def write_table(ws, table, my_order)
+  keylist = []
+  table.each { |row| keylist |= row.keys } # form the superset of all the keys
+  colnum = 0
+  # First, write the columns for the prioritised keys
+  my_order.each do |key|
+    ws.add_cell(0, colnum, key.to_s) # the column title
+    rownum = 1
+    table.each do |row|
+      ws.add_cell(rownum, colnum, row[key])
+      #row.delete(key)
+      rownum += 1
+    end
+    colnum += 1
+    keylist.delete(key)
   end
-  data.each do |key, val|
-    ws_add_data(ws, row, col, key, val)
-    col += 1
+  # Then, write the columns for the remaining keys
+  keylist.each do |key|
+    ws.add_cell(0, colnum, key.to_s) # the column title
+    rownum = 1
+    table.each do |row|
+      ws.add_cell(rownum, colnum, row[key])
+      #row.delete(key)
+      rownum += 1
+    end
+    colnum += 1
   end
 end
 
@@ -125,15 +133,15 @@ def read_server_write_file(agent, username, password, url, outfilename, field_bl
         ext_grid_result = get_page(agent, username, password, url + AJAX,
                                    {module: :core, command: :getExtensionGrid, type: tech, order: :asc}, ext_page.uri.to_s)
         ext_grid = JSON.parse(ext_grid_result.body)
-        row = 1
+        extn_table = []
         ext_grid.each do |ext|
           ext_page = get_page(agent, username, password, url + CONFIG,
                               {display: :extensions, extdisplay: ext['extension']}, ext_grid_result.uri.to_s)
           puts "Extension #{ext['extension']}" unless $quiet
           ws ||= wb.add_worksheet(tab)
-          write_row_from_form(ws, row, ext_page.form('frm_extensions'), field_blacklist[category], field_order[category])
-          row += 1
+          extn_table << construct_row_from_form(ext_page.form('frm_extensions'), field_blacklist[category])
         end
+        write_table(ws, extn_table, field_order[category]) if ws
 
       # Trunks have a subcategory: tech.  Different technologies have different attributes, which means they can't
       # share a tab in the Excel file so easily.
@@ -144,10 +152,9 @@ def read_server_write_file(agent, username, password, url, outfilename, field_bl
                                       {module: :core, command: :getJSON, jdata: :allTrunks, order: :asc}, trunks_page.uri.to_s)
         trunks_grid = JSON.parse(trunks_grid_result.body)
 
-        row = 1
+        trnk_table = []
         trunks_page.css('table#table-all/tbody/tr').each do |tr|  # For each trunk, find its table row...
           next unless tr.css('td')[1].text == tech                # ...ignore if wrong tech
-          override = {}
           a = tr.css('td/a')                                      # Find the 'edit' link
           if a and a.first
             linkaddr = a.first['href']                            # Follow trunk's 'edit' link
@@ -173,10 +180,9 @@ def read_server_write_file(agent, username, password, url, outfilename, field_bl
             }
 
             ws ||= wb.add_worksheet(tab)
-            write_row_from_form(ws, row, trunk_page.form('trunkEdit'),
-                                field_blacklist[category], field_order[category], override)
-            row += 1
+            trnk_table << construct_row_from_form(trunk_page.form('trunkEdit'), field_blacklist[category], override)
           end
+          write_table(ws, trnk_table, field_order[category]) if ws
         end
     end
   end
