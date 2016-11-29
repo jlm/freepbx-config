@@ -108,8 +108,6 @@ end
 # Log in to the FreePBX server and read various parameters.  Save them into an Excel spreadsheet.
 ####
 def read_server_write_file(agent, username, password, url, outfilename, field_blacklist, field_order, categories)
-  stage = 2
-
   wb = RubyXL::Workbook.new
 
   # Admin worksheet
