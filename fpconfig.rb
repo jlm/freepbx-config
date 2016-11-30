@@ -41,7 +41,7 @@ end
 def get_page(agent, creds, url, params, referer = nil)
   page = get_with_ref(agent, url, params, referer)
   if /text\/html/ =~ page.response['content-type']
-    if page.form.field_with(value: 'setup_admin')
+    if page.form && page.form.field_with(value: 'setup_admin')
       setup_admin = page.form
       setup_admin.username = creds[:username]
       setup_admin.password1 = creds[:password]
@@ -127,8 +127,8 @@ def read_server_write_file(agent, creds, url, outfilename, field_blacklist, fiel
   ws_admin = wb.add_worksheet('Admin')
   ws_admin.add_cell(0, 0, 'Admin user')
   ws_admin.add_cell(0, 1, 'Password')
-  ws_admin.add_cell(1, 0, username)
-  ws_admin.add_cell(1, 1, password)
+  ws_admin.add_cell(1, 0, creds[:username])
+  ws_admin.add_cell(1, 1, creds[:password])
 
   SUPPORTED_TABS.each do |tab|
     category = tab.downcase
