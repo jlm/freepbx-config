@@ -36,18 +36,32 @@ end
 
 ####
 # Call Mechanize's get method with an optional referer, and if FreePBX returns a page with a login form,
-# fill it in, submit it and then try again.
+# fill it in, submit it and then try again.  Also, if the server is unconfigured, set up the initial credentials
+# and skip the free trial offer.
 ####
-def get_page(agent, username, password, url, params, referer = nil)
+def get_page(agent, creds, url, params, referer = nil)
   page = get_with_ref(agent, url, params, referer)
   if /text\/html/ =~ page.response['content-type']
+    if page.form.field_with(value: 'setup_admin')
+      setup_admin = page.form
+      setup_admin.username = creds[:username]
+      setup_admin.password1 = creds[:password]
+      setup_admin.password2 = creds[:password]
+      abort "Error: can't configure an unconfigured server unless an email address is given with --email or in secrets.yml" unless creds[:email]
+      setup_admin.email = creds[:email]
+      page = setup_admin.submit
+    end
     unless page.css('div#login_form').empty?
       login_form = page.forms[0]
-      login_form.username = username
-      login_form.password = password
+      login_form.username = creds[:username]
+      login_form.password = creds[:password]
       page = agent.submit(login_form)
       abort 'Error: login failed' unless page.css('div#login_form').empty?
       page = get_with_ref(agent, url, params, referer)
+    end
+    if page.form_with(id: 'oobepost')
+      skip_trial = page.form
+      page = skip_trial.submit(skip_trial.button_with(name: 'skiptrial'))
     end
   end
   page
@@ -107,7 +121,7 @@ end
 ####
 # Log in to the FreePBX server and read various parameters.  Save them into an Excel spreadsheet.
 ####
-def read_server_write_file(agent, username, password, url, outfilename, field_blacklist, field_order, categories)
+def read_server_write_file(agent, creds, url, outfilename, field_blacklist, field_order, categories)
   wb = RubyXL::Workbook.new
 
   # Admin worksheet
@@ -127,13 +141,13 @@ def read_server_write_file(agent, username, password, url, outfilename, field_bl
       # share a tab in the Excel file so easily.
       when /extensions\./
         category,tech = category.split('.')
-        ext_page = get_page(agent, username, password, url + CONFIG, {display: category})
-        ext_grid_result = get_page(agent, username, password, url + AJAX,
+        ext_page = get_page(agent, creds, url + CONFIG, {display: category})
+        ext_grid_result = get_page(agent, creds, url + AJAX,
                                    {module: :core, command: :getExtensionGrid, type: tech, order: :asc}, ext_page.uri.to_s)
         ext_grid = JSON.parse(ext_grid_result.body)
         extn_table = []
         ext_grid.each do |ext|
-          ext_page = get_page(agent, username, password, url + CONFIG,
+          ext_page = get_page(agent, creds, url + CONFIG,
                               {display: :extensions, extdisplay: ext['extension']}, ext_grid_result.uri.to_s)
           puts "Extension #{ext['extension']}" unless $quiet
           ws ||= wb.add_worksheet(tab)
@@ -145,8 +159,8 @@ def read_server_write_file(agent, username, password, url, outfilename, field_bl
       # share a tab in the Excel file so easily.
       when /trunks\./
         category,tech = category.split('.')
-        trunks_page = get_page(agent, username, password, url + CONFIG, {display: :trunks})
-        trunks_grid_result = get_page(agent, username, password, url + AJAX,
+        trunks_page = get_page(agent, creds, url + CONFIG, {display: :trunks})
+        trunks_grid_result = get_page(agent, creds, url + AJAX,
                                       {module: :core, command: :getJSON, jdata: :allTrunks, order: :asc}, trunks_page.uri.to_s)
         trunks_grid = JSON.parse(trunks_grid_result.body)
 
@@ -156,7 +170,7 @@ def read_server_write_file(agent, username, password, url, outfilename, field_bl
           a = tr.css('td/a')                                      # Find the 'edit' link
           if a and a.first
             linkaddr = a.first['href']                            # Follow trunk's 'edit' link
-            trunk_page = get_page(agent, username, password, url + ADMIN + '/' + linkaddr, '', trunks_page.uri.to_s)
+            trunk_page = get_page(agent, creds, url + ADMIN + '/' + linkaddr, '', trunks_page.uri.to_s)
             # Look up this trunk in the JSON data returned from the AJAX request (without assuming row ordering)
             trk_data = trunks_grid.detect { |e| e['trunkid'] == tr['id'] }
             puts "Trunk #{trk_data['name']}" unless $quiet
@@ -193,15 +207,15 @@ end
 # Retrieve the form relating to a particular spreadsheet row from the server and fill it in with the provided data.
 # Submit the form.
 ####
-def fill_form_and_submit(agent, username, password, url, category, tech, data)
+def fill_form_and_submit(agent, creds, url, category, tech, data)
   case category
     when 'extensions'
       puts "uploading #{category.chop}: #{data[category.chop].to_s}" unless $quiet
-      cat_page = get_page(agent, username, password, url + CONFIG, {display: category, tech_hardware: 'custom_custom'})
+      cat_page = get_page(agent, creds, url + CONFIG, {display: category, tech_hardware: 'custom_custom'})
       frm = cat_page.form('frm_extensions')
     when 'trunks'
       puts "uploading #{category.chop}: #{data['trunk_name'].to_s}" unless $quiet
-      cat_page = get_page(agent, username, password, url + CONFIG, {display: category, tech: tech.upcase})
+      cat_page = get_page(agent, creds, url + CONFIG, {display: category, tech: tech.upcase})
       frm = cat_page.form('trunkEdit')
   end
   abort 'error: form not found' unless frm
@@ -216,7 +230,7 @@ def fill_form_and_submit(agent, username, password, url, category, tech, data)
   frm.submit
 end
 
-def read_file_write_server(agent, username, password, url, infilename, categories)
+def read_file_write_server(agent, creds, url, infilename, categories)
   wb = RubyXL::Parser.parse(infilename)
   puts "Reading from #{infilename}" if $debug
   result_page = nil
@@ -252,7 +266,7 @@ def read_file_write_server(agent, username, password, url, infilename, categorie
             end
             colnum += 1
           end
-          result_page = fill_form_and_submit(agent, username, password, url, category, tech, data)
+          result_page = fill_form_and_submit(agent, creds, url, category, tech, data)
         end
         rownum += 1
       end
@@ -282,6 +296,7 @@ begin
     o.string '-s', '--secrets', 'pathname of secrets file in YAML format (default: secrets.yml)', default: 'secrets.yml'
     o.string '-u', '--username', 'username to access the FreePBX server'
     o.string '-p', '--password', 'password to access the FreePBX server'
+    o.string '-e', '--email', 'email address for setup of unconfigured server'
     o.array '-c', '--categories', 'list of categories (e.g. "trunks") to process, default: all', delimiter: ','
     o.bool '-d', '--debug', 'print verbose debug messages'
     o.bool '-q', '--quiet', 'do not print progress messages'
@@ -305,7 +320,9 @@ url = opts.arguments[0] || config['url']
 abort 'FreePBX server URL must be given on the command line (first argument) or in the configuration file' unless url
 username = opts[:username] || config['username']
 password = opts[:password] || config['password']
-if opts[:output]
+email = opts[:email] || config['email']
+creds = { username: username, password: password, email: email }
+if opts[:output] || opts[:write_to_server]
   abort 'username to access FreePBX server must be given on the command line (--username) or in the configuration file' unless username
   abort 'password to access FreePBX server must be given on the command line (--password) or in the configuration file' unless password
 end
@@ -327,10 +344,10 @@ agent = Mechanize.new
 agent.set_proxy(ph, pp) if $debug && ph && pp
 
 if opts[:output]
-  read_server_write_file(agent, username, password, url, opts[:output],
+  read_server_write_file(agent, creds, url, opts[:output],
                          config['field_blacklist'], config['field_order'], opts[:categories])
 end
 
 if opts[:write_to_server]
-  read_file_write_server(agent, username, password, url, opts[:write_to_server], opts[:categories])
+  read_file_write_server(agent, creds, url, opts[:write_to_server], opts[:categories])
 end
