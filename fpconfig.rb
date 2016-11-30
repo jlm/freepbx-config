@@ -21,7 +21,6 @@ AJAX = ADMIN + '/ajax.php'
 
 SUPPORTED_TABS = %w(Extensions.dahdi Extensions.sip Extensions.iax2 Trunks.dahdi Trunks.sip Trunks.iax2)
 
-
 ####
 # Call Mechanize's get method with an optional referer.
 # There must be a proper way to do this, but I couldn't figure it out.
